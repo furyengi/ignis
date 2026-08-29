@@ -1,5 +1,7 @@
 # ignis
 
+[![ci](https://github.com/furyengi/ignis/actions/workflows/ci.yml/badge.svg)](https://github.com/furyengi/ignis/actions/workflows/ci.yml)
+
 A self-hosted serverless runtime. Deploy a function, invoke it over HTTP, and get told exactly where every millisecond went.
 
 Most "build your own Lambda" projects stop at "it runs the function." The interesting part is what happens on request #1 versus request #2 — so this one measures the difference and publishes the numbers.

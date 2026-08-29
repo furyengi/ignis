@@ -1,0 +1,20 @@
+{
+  "name": "ignis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A self-hosted serverless runtime. Cold starts, measured.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "ignisctl": "./dist/src/cli.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "node --test dist/test/",
+    "bench": "node dist/bench/bench.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

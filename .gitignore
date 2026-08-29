@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.env
+*.tsbuildinfo
+
+# Benchmark output is scratch, except the committed reference run the README
+# quotes -- that is evidence, not build output.
+bench-results/*
+!bench-results/latest.json

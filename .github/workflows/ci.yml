@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The process backend is meant to run anywhere; prove it rather than
+        # assume it.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['20', '22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck and build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+        env:
+          # GitHub runners are slower and noisier than a laptop; the pool's
+          # acquire timeout is generous enough, but keep logs off so a failure
+          # is readable.
+          IGNIS_LOG: 'off'
+
+  bench:
+    # Benchmark numbers from a shared CI runner are not comparable across runs,
+    # so this gate only checks that the harness still runs and the warm path is
+    # meaningfully faster than the cold one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Benchmark
+        run: node dist/bench/bench.js --iterations 100 --concurrency 8 --json bench-results/ci.json
+
+      - name: Assert warm pool still pays for itself
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const r = JSON.parse(readFileSync("./bench-results/ci.json", "utf8"));
+            const cold = r.scenarios.find((s) => s.name === "cold").coldStart.p50;
+            const warm = r.scenarios.find((s) => s.name === "warm").latency.p50;
+            console.log(`cold p50 ${cold.toFixed(1)}ms, warm p50 ${warm.toFixed(2)}ms`);
+            if (!(cold / warm > 10)) {
+              console.error("warm path is not meaningfully faster than cold -- pool regression?");
+              process.exit(1);
+            }
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results/ci.json

@@ -13,6 +13,7 @@ import { Histogram } from '../src/metrics.js';
 import { POOL_DEFAULTS } from '../src/pool.js';
 import { Scheduler } from '../src/scheduler.js';
 import { FunctionRegistry } from '../src/registry/functions.js';
+import { MemoryStore } from '../src/registry/store.js';
 
 process.env.IGNIS_LOG = 'off';
 
@@ -43,28 +44,53 @@ describe('metrics', () => {
 });
 
 describe('registry', () => {
-  it('bumps the version on every deploy', () => {
+  it('bumps the version on every deploy', async () => {
     const r = new FunctionRegistry();
-    assert.equal(r.deploy({ name: 'a', entrypoint: HELLO }).version, 1);
-    assert.equal(r.deploy({ name: 'a', entrypoint: HELLO }).version, 2);
+    assert.equal((await r.deploy({ name: 'a', entrypoint: HELLO })).version, 1);
+    assert.equal((await r.deploy({ name: 'a', entrypoint: HELLO })).version, 2);
   });
 
-  it('carries forward fields the redeploy omits', () => {
+  it('carries forward fields the redeploy omits', async () => {
     const r = new FunctionRegistry();
-    r.deploy({ name: 'a', entrypoint: HELLO, memoryMib: 256, minWarm: 2 });
-    const v2 = r.deploy({ name: 'a', entrypoint: HELLO });
+    await r.deploy({ name: 'a', entrypoint: HELLO, memoryMib: 256, minWarm: 2 });
+    const v2 = await r.deploy({ name: 'a', entrypoint: HELLO });
     assert.equal(v2.memoryMib, 256);
     assert.equal(v2.minWarm, 2);
   });
 
-  it('rejects invalid names, missing entrypoints and impossible limits', () => {
+  it('rejects invalid names, missing entrypoints and impossible limits', async () => {
     const r = new FunctionRegistry();
-    assert.throws(() => r.deploy({ name: 'Bad Name', entrypoint: HELLO }), /invalid function name/);
-    assert.throws(() => r.deploy({ name: 'a', entrypoint: '/nope/nope.mjs' }), /does not exist/);
-    assert.throws(
+    await assert.rejects(
+      () => r.deploy({ name: 'Bad Name', entrypoint: HELLO }),
+      /invalid function name/,
+    );
+    await assert.rejects(
+      () => r.deploy({ name: 'a', entrypoint: '/nope/nope.mjs' }),
+      /does not exist/,
+    );
+    await assert.rejects(
       () => r.deploy({ name: 'a', entrypoint: HELLO, minWarm: 5, maxConcurrency: 2 }),
       /minWarm cannot exceed/,
     );
+  });
+
+  it('restores persisted specs into the read cache', async () => {
+    // Two registries over one store stands in for a control-plane restart.
+    const store = new MemoryStore();
+    const first = new FunctionRegistry(store);
+    await first.deploy({ name: 'survivor', entrypoint: HELLO, memoryMib: 192 });
+    await first.deploy({ name: 'survivor', entrypoint: HELLO });
+
+    const second = new FunctionRegistry(store);
+    assert.equal(second.has('survivor'), false, 'cache starts empty');
+
+    await second.hydrate();
+    const spec = second.get('survivor');
+    assert.equal(spec.version, 2, 'version must survive the restart');
+    assert.equal(spec.memoryMib, 192);
+
+    // And the next deploy continues the sequence rather than restarting it.
+    assert.equal((await second.deploy({ name: 'survivor', entrypoint: HELLO })).version, 3);
   });
 });
 

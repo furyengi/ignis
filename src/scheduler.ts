@@ -12,6 +12,7 @@ import { log } from './log.js';
 import { RuntimeMetrics } from './metrics.js';
 import { PoolManager, POOL_DEFAULTS, type PoolOptions } from './pool.js';
 import { FunctionRegistry } from './registry/functions.js';
+import type { FunctionStore } from './registry/store.js';
 import { isSnapshotCapable, type SandboxBackend } from './backends/backend.js';
 import {
   SnapshotManager,
@@ -27,7 +28,7 @@ import {
 } from './types.js';
 
 export class Scheduler {
-  readonly registry = new FunctionRegistry();
+  readonly registry: FunctionRegistry;
   readonly metrics = new RuntimeMetrics();
   private readonly pools: PoolManager;
   private readonly logger = log.child({ component: 'scheduler' });
@@ -39,7 +40,10 @@ export class Scheduler {
     backend: SandboxBackend,
     opts: PoolOptions = POOL_DEFAULTS,
     snapshotOpts?: Partial<SnapshotOptions>,
+    /** Durable spec storage. Defaults to in-memory, which forgets on restart. */
+    store?: FunctionStore,
   ) {
+    this.registry = new FunctionRegistry(store);
     if (isSnapshotCapable(backend)) {
       this.snapshots = new SnapshotManager(backend.snapshots, this.metrics, {
         ...SNAPSHOT_DEFAULTS,
@@ -61,9 +65,34 @@ export class Scheduler {
     this.logger.info('scheduler started', { backend: this.backend.name });
   }
 
+  /**
+   * Restore persisted functions and warm them back up.
+   *
+   * Prewarming is best-effort per function: one deployment whose entrypoint has
+   * gone missing must not stop the others from coming back.
+   */
+  async hydrate(): Promise<FunctionSpec[]> {
+    const specs = await this.registry.hydrate();
+    await Promise.all(
+      specs.map(async (spec) => {
+        const pool = this.pools.forFunction(spec);
+        try {
+          await pool.prewarm();
+        } catch (err) {
+          this.logger.warn('could not prewarm restored function', {
+            fn: spec.name,
+            version: spec.version,
+            err: (err as Error).message,
+          });
+        }
+      }),
+    );
+    return specs;
+  }
+
   /** Register a function and bring its warm pool up to `minWarm`. */
   async deploy(input: FunctionInput): Promise<FunctionSpec> {
-    const spec = this.registry.deploy(input);
+    const spec = await this.registry.deploy(input);
     const pool = this.pools.forFunction(spec);
     this.metrics.counters.inc('deploys_total');
     this.logger.info('deployed', {
@@ -85,7 +114,7 @@ export class Scheduler {
 
   async remove(name: string): Promise<void> {
     if (!this.registry.has(name)) throw new IgnisError(`function "${name}" not found`, 'NOT_FOUND', 404);
-    this.registry.delete(name);
+    await this.registry.delete(name);
     await this.pools.remove(name);
     await this.snapshots?.onRemove(name);
     this.logger.info('removed', { fn: name });
@@ -161,6 +190,7 @@ export class Scheduler {
   async stats() {
     return {
       backend: this.backend.name,
+      store: this.registry.backend,
       snapshots: (await this.snapshots?.stats()) ?? null,
       functions: this.registry.list().map((s) => ({
         name: s.name,
@@ -178,5 +208,6 @@ export class Scheduler {
   async shutdown(): Promise<void> {
     this.logger.info('scheduler shutting down');
     await this.pools.shutdown();
+    await this.registry.close();
   }
 }

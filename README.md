@@ -157,6 +157,42 @@ Snapshots are opt-in (`IGNIS_FC_SNAPSHOT=1`). Capturing costs a full boot and a
 memory image per version — not something to start doing because the backend
 merely could.
 
+### The registry is durable, and still not on the hot path
+
+By default deployments live in memory and a restart forgets them. Point ignis at
+Postgres and they survive:
+
+```bash
+IGNIS_DATABASE_URL=postgres://ignis:ignis@localhost:5432/ignis npm start
+```
+
+Restart the control plane and the deployments come back — versions intact, warm
+pools refilled during startup, before the listener accepts traffic.
+
+The registry is a **write-through cache**, not a database wrapper. `get()` runs
+on every invocation, so it stays synchronous and in-memory; the store is touched
+only on deploy, delete and startup. Writes go to the store first and update the
+cache once durable — the reverse would let a failed write leave the cache
+serving a version that does not exist.
+
+**Version allocation belongs to the database.** The upsert increments in the
+same statement:
+
+```sql
+ON CONFLICT (name) DO UPDATE SET
+  version = ignis_functions.version + 1
+```
+
+Read-modify-write from the application would let two concurrent deploys both
+read v3 and both write v4 — two different code versions claiming one number,
+while the pool uses exactly that number to decide which sandboxes are stale. A
+test fires twelve concurrent deploys and asserts the versions come back as
+`1..12` with no duplicates.
+
+Migrations run under a `pg_advisory_lock`, because concurrent
+`CREATE TABLE IF NOT EXISTS` from several nodes deadlocks in Postgres rather
+than politely no-opping.
+
 ## Backends
 
 | | `process` | `firecracker` |
@@ -187,7 +223,7 @@ resuming a VM that is already past handler load.
 | `GET /functions` | list |
 | `DELETE /functions/:name` | drain and remove |
 | `POST /invoke/:name` | invoke; body is the payload |
-| `GET /stats` | pools, versions, snapshots, latency percentiles |
+| `GET /stats` | pools, versions, store, snapshots, latency percentiles |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /healthz` | liveness |
 
@@ -214,18 +250,24 @@ own cost with no loopback socket in the way.
 npm test
 ```
 
-27 tests. The integration suite drives the real process backend with no mocks —
+28 tests. The integration suite drives the real process backend with no mocks —
 the properties worth testing (warm reuse, concurrency ceilings, timeout
 enforcement, version draining) only exist once sandboxes are actually booting.
 The snapshot suite drives a fake store, because the policy under test is
-backend-agnostic and running it should not require KVM.
+backend-agnostic and running it should not require KVM. The Postgres suite is
+the opposite: it needs a real server, because what it checks (atomic version
+allocation, advisory locks, jsonb round-trips) are properties of Postgres, not
+of my code. CI supplies one as a service container; locally it skips unless
+`IGNIS_TEST_DATABASE_URL` is set.
 
 ## Known limits
 
-- The registry is in-memory: restarting the control plane forgets every
-  deployment. It sits behind an interface for exactly this reason, but there is
-  no etcd or Postgres implementation yet.
-- One control plane, no clustering. Scheduling is per-node.
+- One control plane, no clustering. Two nodes sharing a database each allocate
+  versions correctly, but neither is told when the other deploys, so their read
+  caches drift until restart. LISTEN/NOTIFY on the functions table is the fix
+  and is not implemented.
+- Snapshots are host-local, so a second node starts cold even for a function
+  another node has already captured.
 - The Firecracker backend needs a prebuilt rootfs; there is no image builder in
   this repo beyond the documented steps.
 - Node has no `AF_VSOCK` binding, so the guest reaches the host through a

@@ -17,6 +17,8 @@ import { resolveBackend, type BackendName } from './backends/registry.js';
 import { log } from './log.js';
 import { POOL_DEFAULTS } from './pool.js';
 import { Scheduler } from './scheduler.js';
+import { MemoryStore, type FunctionStore } from './registry/store.js';
+import { PostgresStore } from './registry/postgres.js';
 import { IgnisError } from './types.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -59,12 +61,32 @@ function send(res: http.ServerResponse, status: number, body: unknown): void {
 export interface ServerOptions {
   port: number;
   backend: BackendName;
+  /**
+   * Postgres connection string. Omitted means the in-memory store, which
+   * forgets every deployment on restart.
+   */
+  databaseUrl?: string;
+}
+
+/**
+ * Pick a store from configuration.
+ *
+ * Defaulting to memory keeps `npm start` working with no database, and makes
+ * the durable option an explicit choice rather than a silent dependency.
+ */
+export function resolveStore(databaseUrl: string | undefined): FunctionStore {
+  if (!databaseUrl) return new MemoryStore();
+  return new PostgresStore({ connectionString: databaseUrl });
 }
 
 export async function createServer(opts: ServerOptions) {
   const backend = await resolveBackend(opts.backend);
-  const scheduler = new Scheduler(backend, POOL_DEFAULTS);
+  const store = resolveStore(opts.databaseUrl);
+  const scheduler = new Scheduler(backend, POOL_DEFAULTS, undefined, store);
   await scheduler.start();
+  // Bring persisted deployments back before accepting traffic, so a restart
+  // does not serve 404s for functions that are still deployed.
+  await scheduler.hydrate();
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -140,10 +162,14 @@ if (isMain) {
   const port = Number(process.env.PORT ?? 8080);
   const backendName = (process.env.IGNIS_BACKEND as BackendName) ?? 'auto';
 
-  const { server, scheduler, backend } = await createServer({ port, backend: backendName });
+  const { server, scheduler, backend } = await createServer({
+    port,
+    backend: backendName,
+    databaseUrl: process.env.IGNIS_DATABASE_URL,
+  });
 
   server.listen(port, () => {
-    log.info('ignis listening', { port, backend: backend.name });
+    log.info('ignis listening', { port, backend: backend.name, store: scheduler.registry.backend });
   });
 
   const shutdown = async (signal: string) => {

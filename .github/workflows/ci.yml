@@ -37,6 +37,57 @@ jobs:
           # is readable.
           IGNIS_LOG: 'off'
 
+  postgres:
+    # The Postgres store's interesting properties are Postgres' properties --
+    # atomic version allocation, advisory locks, jsonb round-tripping -- so they
+    # are tested against a real server rather than a fake. Service containers
+    # are Linux-only, which is why this is its own job.
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ignis
+          POSTGRES_PASSWORD: ignis
+          POSTGRES_DB: ignis_test
+        ports:
+          - 5432:5432
+        # Without the health check the suite races the server's startup.
+        options: >-
+          --health-cmd "pg_isready -U ignis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      - name: Test against a real Postgres
+        run: node --test "dist/test/postgres.test.js"
+        env:
+          IGNIS_LOG: 'off'
+          IGNIS_TEST_DATABASE_URL: postgres://ignis:ignis@127.0.0.1:5432/ignis_test
+
+      - name: Fail if the suite silently skipped
+        # A skipped suite still exits 0, so a broken connection string would
+        # look exactly like a passing run. Assert it actually executed.
+        run: |
+          node --test "dist/test/postgres.test.js" 2>&1 | tee /tmp/pg.log
+          if grep -q "set IGNIS_TEST_DATABASE_URL to run" /tmp/pg.log; then
+            echo "::error::postgres suite skipped -- it never reached the database"
+            exit 1
+          fi
+        env:
+          IGNIS_LOG: 'off'
+          IGNIS_TEST_DATABASE_URL: postgres://ignis:ignis@127.0.0.1:5432/ignis_test
+
   bench:
     # Benchmark numbers from a shared CI runner are not comparable across runs,
     # so this gate only checks that the harness still runs and the warm path is

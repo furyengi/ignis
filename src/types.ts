@@ -82,6 +82,12 @@ export interface ColdStartBreakdown {
   loadMs: number;
   /** bootMs + loadMs. */
   totalMs: number;
+  /**
+   * True when this sandbox was resumed from a snapshot rather than booted.
+   * Restored and booted cold starts differ by an order of magnitude, so
+   * averaging them together hides the thing worth knowing.
+   */
+  restored?: boolean;
 }
 
 /**

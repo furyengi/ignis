@@ -15,10 +15,16 @@
  *   6. PUT /actions         InstanceStart
  *   7. accept the guest shim's vsock connection, then `load`
  *
- * With `snapshot.enabled`, steps 2-6 are replaced by a snapshot restore of a
- * VM already past handler load. That is the difference between a ~125ms cold
- * start and a ~10ms one, because it skips kernel boot, Node startup and the
- * handler's own module graph.
+ * With `snapshot.enabled` the backend also exposes a SnapshotStore. Restore
+ * replaces steps 2-7 with a single `PUT /snapshot/load` of a VM already past
+ * handler load: no kernel boot, no Node startup, no module graph. That is the
+ * difference between a ~125ms cold start and a ~10ms one.
+ *
+ * Restore is a separate entry point rather than a branch inside `create`. When
+ * the two were fused, the restore path fell through into `loadHandler` and
+ * re-imported the module the snapshot had been taken to preserve -- paying the
+ * exact cost it existed to remove. Deciding *when* to restore belongs to
+ * `snapshots.ts`; this file only knows how.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -36,7 +42,12 @@ import {
   type InvokeResult,
   TIMEOUT_GRACE_MS,
 } from '../types.js';
-import type { Sandbox, SandboxBackend } from './backend.js';
+import type {
+  Sandbox,
+  SandboxBackend,
+  SnapshotInfo,
+  SnapshotStore,
+} from './backend.js';
 import {
   NdjsonDecoder,
   encodeNdjson,
@@ -229,6 +240,7 @@ export class FirecrackerBackend implements SandboxBackend {
 
   constructor(overrides: Partial<FirecrackerConfig> = {}) {
     this.cfg = { ...FIRECRACKER_DEFAULTS, ...overrides };
+    if (this.cfg.snapshot.enabled) this.snapshots = this.makeSnapshotStore();
   }
 
   async preflight(): Promise<void> {
@@ -253,13 +265,26 @@ export class FirecrackerBackend implements SandboxBackend {
     await fs.mkdir(this.cfg.runDir, { recursive: true });
   }
 
-  async create(spec: FunctionSpec): Promise<Sandbox> {
-    const bootStart = performance.now();
+  /**
+   * Allocate paths, start the VMM process and begin listening for the guest.
+   *
+   * Shared by boot, restore and capture -- all three need a live VMM with an
+   * API socket and a pending guest connection before they diverge.
+   */
+  private startVmm(): {
+    vmId: string;
+    apiSock: string;
+    vsockUds: string;
+    overlay: string;
+    listenPath: string;
+    accepted: Promise<net.Socket>;
+    vmm: ChildProcess;
+    paths: string[];
+  } {
     const vmId = `vm-${randomUUID().slice(0, 8)}`;
     const apiSock = path.join(this.cfg.runDir, `${vmId}.api.sock`);
     const vsockUds = path.join(this.cfg.runDir, `${vmId}.vsock`);
     const overlay = path.join(this.cfg.runDir, `${vmId}.overlay.ext4`);
-
     // The host listens; the guest dials CID 2 and Firecracker bridges the
     // connection to `<uds_path>_<port>`.
     const listenPath = `${vsockUds}_${this.cfg.vsockPort}`;
@@ -272,33 +297,51 @@ export class FirecrackerBackend implements SandboxBackend {
       this.logger.warn('vmm stderr', { vmId, line: b.toString().trimEnd() }),
     );
 
+    return {
+      vmId,
+      apiSock,
+      vsockUds,
+      overlay,
+      listenPath,
+      accepted,
+      vmm,
+      paths: [apiSock, vsockUds, listenPath, overlay],
+    };
+  }
+
+  /**
+   * Boot a VM from scratch and load the handler into it.
+   *
+   * Note there is no snapshot branch here any more: restore is a separate
+   * entry point on the snapshot store, chosen by the orchestration layer. When
+   * the two were fused, the restore path went on to call `loadHandler` against
+   * a VM that already had the module loaded -- paying the import cost the
+   * snapshot existed to eliminate.
+   */
+  async create(spec: FunctionSpec): Promise<Sandbox> {
+    const bootStart = performance.now();
+    const vm = this.startVmm();
+
     try {
-      await waitForSocket(apiSock);
+      await waitForSocket(vm.apiSock);
+      await this.configureAndBoot(vm.apiSock, spec, vm.vsockUds, vm.overlay);
 
-      if (this.cfg.snapshot.enabled) {
-        await this.restoreSnapshot(apiSock, spec, vsockUds);
-      } else {
-        await this.configureAndBoot(apiSock, spec, vsockUds, overlay);
-      }
-
-      const conn = await accepted;
+      const conn = await vm.accepted;
       const bootMs = performance.now() - bootStart;
       const loadMs = await this.loadHandler(conn, spec);
 
       return new FirecrackerSandbox(
-        vmId,
+        vm.vmId,
         spec.name,
         spec.version,
-        { bootMs, loadMs, totalMs: performance.now() - bootStart },
-        vmm,
+        { bootMs, loadMs, totalMs: performance.now() - bootStart, restored: false },
+        vm.vmm,
         conn,
-        [apiSock, vsockUds, listenPath, overlay],
+        vm.paths,
       );
     } catch (err) {
-      vmm.kill('SIGKILL');
-      await Promise.all(
-        [apiSock, vsockUds, listenPath, overlay].map((p) => fs.rm(p, { force: true }).catch(() => {})),
-      );
+      vm.vmm.kill('SIGKILL');
+      await Promise.all(vm.paths.map((p) => fs.rm(p, { force: true }).catch(() => {})));
       throw err;
     }
   }
@@ -346,35 +389,164 @@ export class FirecrackerBackend implements SandboxBackend {
     await fcApi(apiSock, 'PUT', '/actions', { action_type: 'InstanceStart' });
   }
 
-  /**
-   * Warm path: restore a VM captured after the handler was already loaded.
-   * Skips kernel boot and module import entirely.
-   */
-  private async restoreSnapshot(apiSock: string, spec: FunctionSpec, vsockUds: string): Promise<void> {
-    const base = path.join(this.cfg.snapshot.dir, `${spec.name}-v${spec.version}`);
-    await fcApi(apiSock, 'PUT', '/snapshot/load', {
-      snapshot_path: `${base}.snap`,
-      mem_backend: { backend_type: 'UffdOverFile', backend_path: `${base}.mem` },
-      enable_diff_snapshots: false,
-      resume_vm: true,
-    });
-    await fcApi(apiSock, 'PATCH', '/vsock', { vsock_id: 'ctrl', uds_path: vsockUds });
+  /** `<dir>/<fn>-v<version>` -- the `.snap` and `.mem` pair share this stem. */
+  private snapshotBase(fn: string, version: number): string {
+    return path.join(this.cfg.snapshot.dir, `${fn}-v${version}`);
   }
 
   /**
-   * Capture a snapshot of a booted, handler-loaded VM. Run once per function
-   * version at deploy time; every subsequent cold start restores from it.
+   * Snapshot support, as consumed by SnapshotManager.
+   *
+   * Left undefined when snapshots are disabled, so `isSnapshotCapable` reports
+   * false and the orchestration layer stays out of the deploy path entirely.
+   * Capturing costs a full boot and a memory image per version -- not something
+   * to start doing because the backend merely could.
    */
-  async captureSnapshot(apiSock: string, spec: FunctionSpec): Promise<void> {
-    const base = path.join(this.cfg.snapshot.dir, `${spec.name}-v${spec.version}`);
-    await fs.mkdir(this.cfg.snapshot.dir, { recursive: true });
-    await fcApi(apiSock, 'PATCH', '/vm', { state: 'Paused' });
-    await fcApi(apiSock, 'PUT', '/snapshot/create', {
-      snapshot_type: 'Full',
-      snapshot_path: `${base}.snap`,
-      mem_file_path: `${base}.mem`,
-    });
-    this.logger.info('snapshot captured', { fn: spec.name, version: spec.version, path: base });
+  readonly snapshots?: SnapshotStore;
+
+  private makeSnapshotStore(): SnapshotStore {
+    return {
+    capture: async (spec: FunctionSpec): Promise<SnapshotInfo> => {
+      const started = performance.now();
+      await fs.mkdir(this.cfg.snapshot.dir, { recursive: true });
+      const base = this.snapshotBase(spec.name, spec.version);
+      const vm = this.startVmm();
+
+      try {
+        await waitForSocket(vm.apiSock);
+        await this.configureAndBoot(vm.apiSock, spec, vm.vsockUds, vm.overlay);
+        const conn = await vm.accepted;
+        // Capture *after* the handler is loaded -- that module import is the
+        // expensive half of a cold start and the main thing being frozen.
+        await this.loadHandler(conn, spec);
+
+        // Pausing first is required: Firecracker refuses to snapshot a running
+        // VM, and a half-quiesced guest would produce a torn memory image.
+        await fcApi(vm.apiSock, 'PATCH', '/vm', { state: 'Paused' });
+        await fcApi(vm.apiSock, 'PUT', '/snapshot/create', {
+          snapshot_type: 'Full',
+          snapshot_path: `${base}.snap`,
+          mem_file_path: `${base}.mem`,
+        });
+
+        const bytes = await totalBytes([`${base}.snap`, `${base}.mem`]);
+        return {
+          fn: spec.name,
+          version: spec.version,
+          bytes,
+          captureMs: performance.now() - started,
+          capturedAt: Date.now(),
+        };
+      } finally {
+        // The capture VM is scaffolding; it never serves traffic.
+        vm.vmm.kill('SIGKILL');
+        await Promise.all(vm.paths.map((p) => fs.rm(p, { force: true }).catch(() => {})));
+      }
+    },
+
+    restore: async (spec: FunctionSpec): Promise<Sandbox | null> => {
+      const base = this.snapshotBase(spec.name, spec.version);
+      try {
+        await Promise.all([fs.access(`${base}.snap`), fs.access(`${base}.mem`)]);
+      } catch {
+        // No image for this version: tell the caller to boot normally.
+        return null;
+      }
+
+      const started = performance.now();
+      const vm = this.startVmm();
+
+      try {
+        await waitForSocket(vm.apiSock);
+        await fcApi(vm.apiSock, 'PUT', '/snapshot/load', {
+          snapshot_path: `${base}.snap`,
+          // Demand-paging beats reading a whole memory image off disk before
+          // the VM can run -- that read is the cost being avoided.
+          mem_backend: { backend_type: 'UffdOverFile', backend_path: `${base}.mem` },
+          enable_diff_snapshots: false,
+          resume_vm: true,
+        });
+        // The restored VM carries the captured VM's socket path; repoint it.
+        await fcApi(vm.apiSock, 'PATCH', '/vsock', { vsock_id: 'ctrl', uds_path: vm.vsockUds });
+
+        const conn = await vm.accepted;
+        const totalMs = performance.now() - started;
+
+        // No loadHandler: the snapshot was taken with the module already
+        // imported, so the guest is ready to serve as soon as it reconnects.
+        return new FirecrackerSandbox(
+          vm.vmId,
+          spec.name,
+          spec.version,
+          { bootMs: totalMs, loadMs: 0, totalMs, restored: true },
+          vm.vmm,
+          conn,
+          vm.paths,
+        );
+      } catch (err) {
+        vm.vmm.kill('SIGKILL');
+        await Promise.all(vm.paths.map((p) => fs.rm(p, { force: true }).catch(() => {})));
+        throw err;
+      }
+    },
+
+    evict: async (fn: string, keepVersion: number | null): Promise<number> => {
+      let entries: string[];
+      try {
+        entries = await fs.readdir(this.cfg.snapshot.dir);
+      } catch {
+        return 0;
+      }
+
+      const removed = new Set<number>();
+      await Promise.all(
+        entries.map(async (name) => {
+          const parsed = parseSnapshotName(name);
+          if (!parsed || parsed.fn !== fn) return;
+          if (keepVersion !== null && parsed.version === keepVersion) return;
+          await fs.rm(path.join(this.cfg.snapshot.dir, name), { force: true }).catch(() => {});
+          removed.add(parsed.version);
+        }),
+      );
+      // Each version is two files; count versions, not unlinks.
+      return removed.size;
+    },
+
+    list: async (): Promise<SnapshotInfo[]> => {
+      let entries: string[];
+      try {
+        entries = await fs.readdir(this.cfg.snapshot.dir);
+      } catch {
+        return [];
+      }
+
+      const byVersion = new Map<string, SnapshotInfo>();
+      for (const name of entries) {
+        const parsed = parseSnapshotName(name);
+        if (!parsed) continue;
+        const key = `${parsed.fn}@${parsed.version}`;
+        let info = byVersion.get(key);
+        if (!info) {
+          info = {
+            fn: parsed.fn,
+            version: parsed.version,
+            bytes: 0,
+            captureMs: 0,
+            capturedAt: 0,
+          };
+          byVersion.set(key, info);
+        }
+        try {
+          const st = await fs.stat(path.join(this.cfg.snapshot.dir, name));
+          info.bytes += st.size;
+          info.capturedAt = Math.max(info.capturedAt, st.mtimeMs);
+        } catch {
+          /* raced with an eviction */
+        }
+      }
+      return [...byVersion.values()];
+      },
+    };
   }
 
   /** Accept exactly one guest connection on the bridged vsock socket. */
@@ -444,4 +616,30 @@ export class FirecrackerBackend implements SandboxBackend {
       )
       .catch(() => {});
   }
+}
+
+/**
+ * Parse `<fn>-v<version>.<snap|mem>`.
+ *
+ * Function names allow hyphens, so the split has to anchor on the *last*
+ * `-v<digits>` group -- splitting on the first one would mangle every
+ * hyphenated name.
+ */
+export function parseSnapshotName(file: string): { fn: string; version: number } | null {
+  const m = /^(.+)-v(\d+)\.(snap|mem)$/.exec(file);
+  if (!m) return null;
+  return { fn: m[1]!, version: Number(m[2]) };
+}
+
+/** Sum the sizes of files that exist, ignoring the ones that do not. */
+async function totalBytes(paths: string[]): Promise<number> {
+  const sizes = await Promise.all(
+    paths.map((p) =>
+      fs
+        .stat(p)
+        .then((s) => s.size)
+        .catch(() => 0),
+    ),
+  );
+  return sizes.reduce((a, b) => a + b, 0);
 }

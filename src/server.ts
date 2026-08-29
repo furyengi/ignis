@@ -104,7 +104,7 @@ export async function createServer(opts: ServerOptions) {
       }
 
       if (method === 'GET' && segments[0] === 'stats') {
-        return send(res, 200, scheduler.stats());
+        return send(res, 200, await scheduler.stats());
       }
 
       if (method === 'GET' && segments[0] === 'metrics') {

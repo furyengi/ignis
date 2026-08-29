@@ -12,7 +12,13 @@ import { log } from './log.js';
 import { RuntimeMetrics } from './metrics.js';
 import { PoolManager, POOL_DEFAULTS, type PoolOptions } from './pool.js';
 import { FunctionRegistry } from './registry/functions.js';
-import type { SandboxBackend } from './backends/backend.js';
+import { isSnapshotCapable, type SandboxBackend } from './backends/backend.js';
+import {
+  SnapshotManager,
+  withSnapshots,
+  SNAPSHOT_DEFAULTS,
+  type SnapshotOptions,
+} from './snapshots.js';
 import {
   IgnisError,
   type FunctionInput,
@@ -25,12 +31,28 @@ export class Scheduler {
   readonly metrics = new RuntimeMetrics();
   private readonly pools: PoolManager;
   private readonly logger = log.child({ component: 'scheduler' });
+  /** Null when the backend cannot snapshot; everything degrades to cold boots. */
+  readonly snapshots: SnapshotManager | null;
+  private readonly backend: SandboxBackend;
 
   constructor(
-    private readonly backend: SandboxBackend,
+    backend: SandboxBackend,
     opts: PoolOptions = POOL_DEFAULTS,
+    snapshotOpts?: Partial<SnapshotOptions>,
   ) {
-    this.pools = new PoolManager(backend, opts);
+    if (isSnapshotCapable(backend)) {
+      this.snapshots = new SnapshotManager(backend.snapshots, this.metrics, {
+        ...SNAPSHOT_DEFAULTS,
+        ...snapshotOpts,
+      });
+      // The pool asks this wrapper for sandboxes and never learns whether it
+      // got a restore or a boot.
+      this.backend = withSnapshots(backend, this.snapshots);
+    } else {
+      this.snapshots = null;
+      this.backend = backend;
+    }
+    this.pools = new PoolManager(this.backend, opts);
   }
 
   async start(): Promise<void> {
@@ -49,6 +71,11 @@ export class Scheduler {
       version: spec.version,
       minWarm: spec.minWarm,
     });
+    // Capture before prewarming so the prewarmed sandboxes are themselves
+    // restores rather than boots -- otherwise the deploy pays full price for
+    // exactly the sandboxes the snapshot was meant to make cheap.
+    await this.snapshots?.onDeploy(spec);
+
     // Prewarming is part of the deploy: returning before the pool is warm
     // would hand the first caller a cold start the operator thought they had
     // paid to avoid.
@@ -60,6 +87,7 @@ export class Scheduler {
     if (!this.registry.has(name)) throw new IgnisError(`function "${name}" not found`, 'NOT_FOUND', 404);
     this.registry.delete(name);
     await this.pools.remove(name);
+    await this.snapshots?.onRemove(name);
     this.logger.info('removed', { fn: name });
   }
 
@@ -130,9 +158,10 @@ export class Scheduler {
     }
   }
 
-  stats() {
+  async stats() {
     return {
       backend: this.backend.name,
+      snapshots: (await this.snapshots?.stats()) ?? null,
       functions: this.registry.list().map((s) => ({
         name: s.name,
         version: s.version,

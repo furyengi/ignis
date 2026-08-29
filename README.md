@@ -9,30 +9,30 @@ Most "build your own Lambda" projects stop at "it runs the function." The intere
 ```
   cold  --  every invocation boots a fresh sandbox
   metric             min      p50      p90      p99      max       n
-  e2e latency       96.5    127.1    143.3    159.9    161.2     100
-  cold start        95.6    125.5    141.7    158.7    159.7     100
+  e2e latency       81.1     93.8    108.7    122.4    124.6     100
+  cold start        79.4     93.0    107.7    121.7    122.5     100
 
   warm  --  single prewarmed sandbox, sequential
   metric             min      p50      p90      p99      max       n
-  e2e latency       0.35     0.43     0.51     0.97     1.11     300
-  throughput   2036 req/s
+  e2e latency       0.22     0.37     0.47     0.75     1.19     300
+  throughput   2412 req/s
 
   warmpool  --  prewarmed pool, 16 concurrent
   metric             min      p50      p90      p99      max       n
-  e2e latency       0.93     2.14     2.63     4.91     5.49     300
-  throughput   6975 req/s
+  e2e latency       0.81     1.92     2.63     3.33     3.48     300
+  throughput   7781 req/s
 
   burst  --  16 concurrent requests, empty pool
   metric             min      p50      p90      p99      max       n
-  e2e latency      229.6    284.4    330.3    341.4    341.4      16
-  cold start       227.8    282.3    328.9    340.1    340.1      16
+  e2e latency      215.8    250.6    334.0    352.7    352.7      16
+  cold start       214.8    249.2    332.7    351.2    351.2      16
 
-  warm pool removes 125.5ms of p50 latency (289x)
+  warm pool removes 93.0ms of p50 latency (248x)
 ```
 
-<sub>`process` backend, Node v24.19.0, 16 cores. Reproduce with `npm run bench`. Raw JSON in `bench-results/`.</sub>
+<sub>`process` backend, Node v24.19.0, Intel i7-8650U, 8 cores. Reproduce with `npm run bench`. Raw JSON in `bench-results/latest.json`.</sub>
 
-Read the burst row rather than the cold row if you want the honest number: 16 simultaneous cold starts cost **284ms at p50**, not 125ms, because they contend for the same cores. A cold-start figure measured one-at-a-time is a best case that no real traffic pattern produces.
+Read the burst row rather than the cold row if you want the honest number: 16 simultaneous cold starts cost **250ms at p50**, not 93ms, because they contend for the same cores. A cold-start figure measured one-at-a-time is a best case that no real traffic pattern produces.
 
 ---
 
@@ -63,7 +63,7 @@ node dist/src/cli.js invoke hello '{"name":"world"}'
   warm  total=2.03ms  cold=0.00ms  handler=0.11ms  sandbox=sb-0ef23d4c
 ```
 
-That first invocation is already warm because `--min-warm 2` made prewarming part of the deploy. Drop the flag and the same command reports `COLD total=127ms`.
+That first invocation is already warm because `--min-warm 2` made prewarming part of the deploy. Drop the flag and the same command reports `COLD total=94ms`.
 
 A function is an ES module exporting `handler`:
 
@@ -121,6 +121,42 @@ contract explicit: *abort first, kill only if that did not work.*
 Both paths are tested — a cooperative handler returns `aborted: true`, an
 uncooperative one spinning in a synchronous loop gets `TIMEOUT`.
 
+### Snapshots: capture once, restore many
+
+Booting a kernel, starting Node and importing the handler's module graph
+produces a byte-identical VM every time. A snapshot pays that once per function
+version and turns every later cold start into a memory restore.
+
+The *when* is separate from the *how*. `snapshots.ts` decides policy — capture
+at deploy, restore on cold start, evict superseded versions — and the backend
+only supplies `capture` / `restore` / `evict` / `list`. Firecracker is the sole
+backend that can freeze a machine, but none of the policy is Firecracker-shaped,
+so it is tested against a fake store on any laptop. That matters, because the
+policy is where the bugs are, not the ioctls.
+
+Restore is wired in as a decorator over the backend, not a branch inside the
+pool. The pool's job is capacity, not provenance: it asks for a sandbox and gets
+one, and the only visible difference is that `coldStart.restored` is true and
+the number is small.
+
+What the orchestration guarantees, each with a test:
+
+- **Capture happens before prewarm.** Otherwise the deploy pays full boot price
+  for exactly the sandboxes the snapshot exists to make cheap.
+- **One capture per version**, even under concurrent deploys. Without
+  single-flight, two callers each boot a VM and race to write the same files.
+- **Capture failure is a performance regression, not a failed deploy.** Out of
+  disk means cold boots, not a broken function.
+- **A corrupt image cannot poison the hot path.** Restore failure falls back to
+  booting and marks the version bad for 30s, so one bad file does not add a
+  doomed restore to every cold start.
+- **Removing a function deletes its images.** A stale memory image is 128MiB+
+  of disk nobody can reach.
+
+Snapshots are opt-in (`IGNIS_FC_SNAPSHOT=1`). Capturing costs a full boot and a
+memory image per version — not something to start doing because the backend
+merely could.
+
 ## Backends
 
 | | `process` | `firecracker` |
@@ -129,7 +165,7 @@ uncooperative one spinning in a synchronous loop gets `TIMEOUT`.
 | Shared kernel | yes | no |
 | Multi-tenant safe | **no** | yes |
 | Runs on | anything with Node | Linux + `/dev/kvm` |
-| Cold start | ~125ms | ~125ms boot, ~10ms from snapshot |
+| Cold start | ~93ms | ~125ms boot, ~10ms from snapshot |
 
 `IGNIS_BACKEND=auto` (the default) picks `firecracker` on Linux and falls back
 to `process` with a warning if KVM or the images are missing — so a laptop gets
@@ -151,7 +187,7 @@ resuming a VM that is already past handler load.
 | `GET /functions` | list |
 | `DELETE /functions/:name` | drain and remove |
 | `POST /invoke/:name` | invoke; body is the payload |
-| `GET /stats` | pools, versions, latency percentiles |
+| `GET /stats` | pools, versions, snapshots, latency percentiles |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /healthz` | liveness |
 
@@ -178,9 +214,11 @@ own cost with no loopback socket in the way.
 npm test
 ```
 
-16 integration tests against the real process backend, no mocks. The properties
-worth testing here — warm reuse, concurrency ceilings, timeout enforcement,
-version draining — only exist once sandboxes are actually booting.
+27 tests. The integration suite drives the real process backend with no mocks —
+the properties worth testing (warm reuse, concurrency ceilings, timeout
+enforcement, version draining) only exist once sandboxes are actually booting.
+The snapshot suite drives a fake store, because the policy under test is
+backend-agnostic and running it should not require KVM.
 
 ## Known limits
 
@@ -194,6 +232,13 @@ version draining — only exist once sandboxes are actually booting.
   `socat` bridge inside the rootfs rather than opening the vsock directly.
 - No auth on the control plane. It binds loopback by default and should stay
   there until that changes.
+- The snapshot **orchestration** is tested; the snapshot **backend** is not.
+  Capture and restore are written against Firecracker's documented API and
+  exercised only through a fake store, because CI has no KVM. Treat the ~10ms
+  restore figure as Firecracker's published number, not as something this repo
+  has measured.
+- Restoring many VMs from one memory image gives them all identical RNG state.
+  Guests must reseed on resume; see [docs/FIRECRACKER.md](docs/FIRECRACKER.md).
 
 ## License
 

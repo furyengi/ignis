@@ -108,8 +108,29 @@ Two things to know before trusting it:
   anything cryptographic the guest must reseed on resume. This is a real
   vulnerability class, not a footnote — Firecracker's own docs cover it.
 
-## Snapshot capture and rootfs building are not automated here
+## What is wired up, and what is not
 
-The API calls are implemented in `src/backends/firecracker.ts`. Wiring them into
-the deploy path — build the image, boot once, capture, store, garbage-collect
-old versions — is the obvious next piece of work and is not done.
+Capture, restore and garbage collection **are** wired into the deploy path.
+`FirecrackerBackend.snapshots` implements the `SnapshotStore` interface, and
+`src/snapshots.ts` drives it: capture once per version at deploy time (before
+prewarming, so the prewarmed sandboxes are themselves restores), restore on
+every cold start, and evict superseded images on redeploy or removal.
+
+Failures degrade rather than propagate. A capture that fails or stalls leaves
+the deploy successful and the function cold-booting; a restore that fails falls
+back to a boot and marks that version bad for 30 seconds so one corrupt image
+cannot add a doomed restore to every cold start.
+
+Still not automated:
+
+- **Rootfs building.** The steps above are manual; there is no image builder.
+- **Snapshot verification.** Nothing checksums an image before restoring it —
+  corruption is detected by the restore failing.
+- **Cross-host snapshot sharing.** Images are local to the host that captured
+  them, so a new node starts cold.
+
+And the honest caveat: this backend's snapshot paths have not been executed
+against a real Firecracker host by this repo's CI, which has no KVM. The
+orchestration above them is fully tested; the API calls themselves are written
+against Firecracker's documented interface and should be treated as unproven
+until you have run them.

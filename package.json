@@ -4,7 +4,7 @@
   "private": true,
   "description": "A self-hosted serverless runtime. Cold starts, measured.",
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "bin": { "ignisctl": "./dist/src/cli.js" },
   "scripts": {
     "build": "tsc -p tsconfig.json",

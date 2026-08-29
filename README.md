@@ -36,6 +36,8 @@ Read the burst row rather than the cold row if you want the honest number: 16 si
 
 ## Quick start
 
+Needs Node 22 or newer. CI covers 22 and 24 on Linux, macOS and Windows.
+
 ```bash
 npm install && npm run build
 npm start

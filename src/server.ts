@@ -87,6 +87,9 @@ export async function createServer(opts: ServerOptions) {
   // Bring persisted deployments back before accepting traffic, so a restart
   // does not serve 404s for functions that are still deployed.
   await scheduler.hydrate();
+  // Then follow other nodes. Started after hydrate so the first thing the
+  // listener can do is apply a change on top of a complete cache.
+  await scheduler.startWatching();
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');

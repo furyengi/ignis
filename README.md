@@ -193,6 +193,39 @@ Migrations run under a `pg_advisory_lock`, because concurrent
 `CREATE TABLE IF NOT EXISTS` from several nodes deadlocks in Postgres rather
 than politely no-opping.
 
+### Nodes stay in step over LISTEN/NOTIFY
+
+Point several nodes at one database and they follow each other's deploys. A
+trigger publishes every write to a `ignis_functions` channel; each node listens
+and updates its cache — draining sandboxes pinned to the superseded version, so
+a deploy on node A cannot leave node B serving v4 while it believes in v5.
+
+The trigger publishes, rather than the application, so *any* writer is seen —
+including a DBA doing surgery in `psql`. A cache that is wrong only in the rare
+case is worse than one that is never wrong.
+
+Three details carry the correctness:
+
+**The listener owns a dedicated connection.** `LISTEN` registers against a
+backend session, so a pooled client stops delivering the moment it is returned
+to the pool — silently, which is the worst possible failure mode for a
+cache-invalidation channel.
+
+**A reconnect triggers a full reload, not a resumption.** Notifications are
+fire-and-forget: anything published while the connection was down is gone, with
+no way to ask for it later. Since we cannot know what was missed, patching is
+guesswork and only a full reload is correct. The resync also handles deletions
+that happened during the gap, which a naive "reload and merge" would miss.
+
+**Events carry a version, not a spec, and reads are version-guarded.** The spec
+is re-read after each event, and two events in quick succession produce two
+reads that can finish in either order. Postgres takes its snapshot at statement
+start, so a slow read genuinely can return an older row — the guard drops it
+rather than letting v4 land on top of v5. (The test for this initially passed
+against a broken implementation; the fake store was returning live state
+instead of a snapshot. It now fails when the guard is removed, which is the
+only reason to trust it.)
+
 ## Backends
 
 | | `process` | `firecracker` |
@@ -223,7 +256,7 @@ resuming a VM that is already past handler load.
 | `GET /functions` | list |
 | `DELETE /functions/:name` | drain and remove |
 | `POST /invoke/:name` | invoke; body is the payload |
-| `GET /stats` | pools, versions, store, snapshots, latency percentiles |
+| `GET /stats` | pools, versions, store, cluster, snapshots, latency percentiles |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /healthz` | liveness |
 
@@ -250,7 +283,7 @@ own cost with no loopback socket in the way.
 npm test
 ```
 
-28 tests. The integration suite drives the real process backend with no mocks —
+35 tests. The integration suite drives the real process backend with no mocks —
 the properties worth testing (warm reuse, concurrency ceilings, timeout
 enforcement, version draining) only exist once sandboxes are actually booting.
 The snapshot suite drives a fake store, because the policy under test is
@@ -262,10 +295,8 @@ of my code. CI supplies one as a service container; locally it skips unless
 
 ## Known limits
 
-- One control plane, no clustering. Two nodes sharing a database each allocate
-  versions correctly, but neither is told when the other deploys, so their read
-  caches drift until restart. LISTEN/NOTIFY on the functions table is the fix
-  and is not implemented.
+- Scheduling is still per-node: each node has its own pools and makes its own
+  placement decisions. Nodes agree on *what* is deployed, not on who runs it.
 - Snapshots are host-local, so a second node starts cold even for a function
   another node has already captured.
 - The Firecracker backend needs a prebuilt rootfs; there is no image builder in

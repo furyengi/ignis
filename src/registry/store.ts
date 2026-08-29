@@ -22,11 +22,52 @@ export interface FunctionStore {
   init(): Promise<void>;
   /** Every spec on record, for hydrating the cache at startup. */
   load(): Promise<FunctionSpec[]>;
+  /** One spec, or null. Used to refresh a single entry after a change event. */
+  get(name: string): Promise<FunctionSpec | null>;
   /** Persist, allocating the next version atomically. */
   put(spec: PendingSpec): Promise<FunctionSpec>;
   /** Returns false if there was nothing to delete. */
   delete(name: string): Promise<boolean>;
   close(): Promise<void>;
+}
+
+/** A write observed somewhere in the cluster. */
+export interface StoreChange {
+  name: string;
+  op: 'upsert' | 'delete';
+  /** Version as of the write. Absent for deletes. */
+  version?: number;
+}
+
+export interface StoreWatcher {
+  /** A single change. May be this node's own write echoed back. */
+  onChange(change: StoreChange): void;
+  /**
+   * The change feed was interrupted and has come back.
+   *
+   * Change events are fire-and-forget: anything published while the connection
+   * was down is gone, with no way to ask for it later. So a reconnect is not a
+   * resumption, it is a gap -- the only safe response is to reload everything.
+   */
+  onResync(): void;
+}
+
+/** Stop watching. Safe to call more than once. */
+export type Unwatch = () => Promise<void>;
+
+/**
+ * A store that can tell this node when another node writes.
+ *
+ * Optional, mirroring the snapshot capability: a store that cannot do this is
+ * still a perfectly good single-node store, and the registry simply keeps a
+ * cache that only its own writes update.
+ */
+export interface WatchableStore extends FunctionStore {
+  watch(watcher: StoreWatcher): Promise<Unwatch>;
+}
+
+export function isWatchable(s: FunctionStore): s is WatchableStore {
+  return typeof (s as WatchableStore).watch === 'function';
 }
 
 /**
@@ -35,13 +76,17 @@ export interface FunctionStore {
  * anything else.
  */
 export class MemoryStore implements FunctionStore {
-  readonly name = 'memory';
+  readonly name: string = 'memory';
   private readonly specs = new Map<string, FunctionSpec>();
 
   async init(): Promise<void> {}
 
   async load(): Promise<FunctionSpec[]> {
     return [...this.specs.values()];
+  }
+
+  async get(name: string): Promise<FunctionSpec | null> {
+    return this.specs.get(name) ?? null;
   }
 
   async put(spec: PendingSpec): Promise<FunctionSpec> {

@@ -23,6 +23,15 @@ const DATABASE_URL = process.env.IGNIS_TEST_DATABASE_URL;
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const HELLO = path.join(REPO_ROOT, 'examples/hello/index.mjs');
 
+/** Poll until `check` holds, so the test does not guess at delivery latency. */
+async function until(check: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('condition never held within timeout');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 function pending(name: string, over: Partial<PendingSpec> = {}): PendingSpec {
   return {
     name,
@@ -139,6 +148,37 @@ describe(
       assert.equal(v3.version, 3);
       assert.equal(v3.memoryMib, 256);
       await second.close();
+    });
+
+    it('propagates a deploy from one node to another', async () => {
+      // Two registries on one database, standing in for two control planes.
+      const a = new FunctionRegistry(new PostgresStore({ connectionString: DATABASE_URL! }));
+      const b = new FunctionRegistry(new PostgresStore({ connectionString: DATABASE_URL! }));
+      try {
+        await a.hydrate();
+        await b.hydrate();
+        assert.equal(await b.startWatching(), true, 'node B should be watching');
+
+        // Node A deploys. Node B was never told directly.
+        const deployed = await a.deploy({ name: 'gossip', entrypoint: HELLO, memoryMib: 320 });
+        await until(() => b.has('gossip'));
+
+        const seen = b.get('gossip');
+        assert.equal(seen.version, deployed.version);
+        assert.equal(seen.memoryMib, 320, 'the whole spec must arrive, not just the name');
+
+        // A redeploy must move B forward too, or B keeps serving stale code.
+        const v2 = await a.deploy({ name: 'gossip', entrypoint: HELLO, memoryMib: 384 });
+        await until(() => b.get('gossip').version === v2.version);
+        assert.equal(b.get('gossip').memoryMib, 384);
+
+        // And a removal must reach B as well.
+        await a.delete('gossip');
+        await until(() => !b.has('gossip'));
+      } finally {
+        await a.close();
+        await b.close();
+      }
     });
 
     it('serialises concurrent migrations instead of deadlocking', async () => {

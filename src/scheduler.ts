@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { log } from './log.js';
 import { RuntimeMetrics } from './metrics.js';
 import { PoolManager, POOL_DEFAULTS, type PoolOptions } from './pool.js';
-import { FunctionRegistry } from './registry/functions.js';
+import { FunctionRegistry, type RegistryChange } from './registry/functions.js';
 import type { FunctionStore } from './registry/store.js';
 import { isSnapshotCapable, type SandboxBackend } from './backends/backend.js';
 import {
@@ -43,7 +43,9 @@ export class Scheduler {
     /** Durable spec storage. Defaults to in-memory, which forgets on restart. */
     store?: FunctionStore,
   ) {
-    this.registry = new FunctionRegistry(store);
+    this.registry = new FunctionRegistry(store, {
+      onRemoteChange: (change) => this.applyRemoteChange(change),
+    });
     if (isSnapshotCapable(backend)) {
       this.snapshots = new SnapshotManager(backend.snapshots, this.metrics, {
         ...SNAPSHOT_DEFAULTS,
@@ -88,6 +90,46 @@ export class Scheduler {
       }),
     );
     return specs;
+  }
+
+  /**
+   * Start reacting to deploys made on other nodes. Returns false when the
+   * store cannot publish changes, which is the single-node case.
+   */
+  async startWatching(): Promise<boolean> {
+    return this.registry.startWatching();
+  }
+
+  /**
+   * Bring this node's pools in line with a write made elsewhere.
+   *
+   * A remote deploy has to drain stale sandboxes here too. Without this the
+   * cache would know about v5 while the pool happily kept serving v4 -- the
+   * exact staleness the version counter exists to prevent, just arriving over
+   * the network instead of locally.
+   */
+  private applyRemoteChange(change: RegistryChange): void {
+    if (change.type === 'delete') {
+      void this.pools.remove(change.name).catch((err: Error) => {
+        this.logger.warn('could not drain pool for remotely removed function', {
+          fn: change.name,
+          err: err.message,
+        });
+      });
+      return;
+    }
+
+    // updateSpec drains sandboxes pinned to the superseded version.
+    const pool = this.pools.forFunction(change.spec);
+    // Refill in the background: a remote deploy must not block the listener,
+    // and minWarm is supposed to hold on every node, not just the one that
+    // happened to receive the deploy.
+    void pool.prewarm().catch((err: Error) => {
+      this.logger.warn('could not prewarm after remote deploy', {
+        fn: change.spec.name,
+        err: err.message,
+      });
+    });
   }
 
   /** Register a function and bring its warm pool up to `minWarm`. */
@@ -191,6 +233,7 @@ export class Scheduler {
     return {
       backend: this.backend.name,
       store: this.registry.backend,
+      watchingCluster: this.registry.watching,
       snapshots: (await this.snapshots?.stats()) ?? null,
       functions: this.registry.list().map((s) => ({
         name: s.name,

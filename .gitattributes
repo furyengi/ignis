@@ -1,0 +1,5 @@
+# CI runs on Linux, Windows and macOS; normalise line endings so checkouts and
+# diffs stay consistent across all three.
+* text=auto eol=lf
+*.png binary
+*.ext4 binary
